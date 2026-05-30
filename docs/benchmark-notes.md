@@ -29,3 +29,12 @@ read-latency cause.
     Replacing `query_row` with raw bind/query is a useful control. If this does
     not close the gap, the wrapper path is not the primary issue.
     
+
+    ## SQLite Compile Options
+
+    Both binaries expose `--dump-sqlite-compile-options`, which prints runtime
+    `PRAGMA compile_options`.
+
+    This is the key diagnostic step: compare the actual SQLite C libraries, not
+    just the Rust and Java wrapper code.
+    
