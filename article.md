@@ -1,4 +1,4 @@
-# Why SQLite Looked Slower in Rust Than Java
+# What a Rust-vs-Java SQLite Benchmark Actually Measured
 
 I was evaluating whether SQLite could be a practical embedded cache for a
 high-throughput key-value workload. The shape is simple: updates arrive
@@ -31,14 +31,19 @@ CREATE TABLE cache (
 ```
 
 At first the Java 25 version looked better on write throughput, while Rust used
-far more memory. The read-latency picture was mixed even in the first run, which
-was the first hint that this was not a simple "Java is faster than Rust" story.
+far more memory. But the read-latency picture was mixed even in the first run.
+Rust was not uniformly slower; in some percentiles it was equal or better, and
+in the far tail it moved around.
+
+That was the first hint that the benchmark was measuring more than one thing.
 SQLite is a C library in both cases. Rust calls it through `rusqlite`; Java
 calls it through xerial's SQLite JDBC driver. The wrapper layer is different,
 but the storage engine is still SQLite.
 
 The initial temptation was to treat this as a Rust-vs-Java result. That turned
-out to be the wrong frame.
+out to be the wrong frame. The useful question was: which parts of the result
+come from SQLite build settings, which parts come from benchmark data ownership,
+and which parts are just noisy mixed-workload tails?
 
 ## Reproducing the Investigation
 
@@ -58,39 +63,38 @@ One run on my machine looked like this:
 
 | Commit | What changed | Rust writes/s | Java writes/s | Rust RSS | Java RSS |
 |---|---|---:|---:|---:|---:|
-| `2b6232d` | Initial benchmark | 12,458 | 13,373 | 3,105 MiB | 526 MiB |
-| `a8cdaa2` | Added compile-option diagnostics | 12,967 | 16,480 | 3,092 MiB | 522 MiB |
-| `965e77e` | Aligned Rust SQLite and release build settings | 13,080 | 13,065 | 3,090 MiB | 515 MiB |
-| `0a20bd4` | Shared Rust value buffers | 12,695 | 13,066 | 98 MiB | 519 MiB |
+| `f6c2aae` | Initial benchmark | 9,685 | 13,774 | 3,094 MiB | 519 MiB |
+| `22a17e9` | Added compile-option diagnostics | 11,310 | 14,321 | 3,095 MiB | 519 MiB |
+| `053bf0f` | Aligned Rust SQLite and release build settings | 17,553 | 16,394 | 3,099 MiB | 537 MiB |
+| `d81712c` | Shared Rust value buffers | 17,493 | 16,725 | 107 MiB | 520 MiB |
 
 Read latency distribution from the same run:
 
 | Commit | Runtime | P50 | P75 | P90 | P95 | P99 |
 |---|---|---:|---:|---:|---:|---:|
-| `2b6232d` | Rust | 132us | 221us | 362us | 744us | 3,638us |
-| `2b6232d` | Java | 131us | 225us | 343us | 1,076us | 3,388us |
-| `a8cdaa2` | Rust | 116us | 214us | 336us | 946us | 4,077us |
-| `a8cdaa2` | Java | 117us | 202us | 300us | 411us | 3,321us |
-| `965e77e` | Rust | 122us | 212us | 316us | 484us | 3,232us |
-| `965e77e` | Java | 115us | 203us | 313us | 461us | 2,915us |
-| `0a20bd4` | Rust | 116us | 214us | 326us | 535us | 5,073us |
-| `0a20bd4` | Java | 117us | 202us | 306us | 443us | 3,340us |
+| `f6c2aae` | Rust | 645us | 1,081us | 1,426us | 1,619us | 2,050us |
+| `f6c2aae` | Java | 197us | 266us | 339us | 394us | 568us |
+| `22a17e9` | Rust | 514us | 976us | 1,333us | 1,513us | 1,828us |
+| `22a17e9` | Java | 201us | 299us | 405us | 473us | 615us |
+| `053bf0f` | Rust | 186us | 261us | 341us | 394us | 515us |
+| `053bf0f` | Java | 192us | 292us | 410us | 486us | 649us |
+| `d81712c` | Rust | 185us | 258us | 337us | 392us | 523us |
+| `d81712c` | Java | 176us | 232us | 290us | 333us | 445us |
 
-That distribution is much more useful than looking only at P99. The P50/P75/P90
-values are mostly close. The P95/P99 columns move around more, which points to
-tail effects from the mixed writer/reader workload and local scheduling noise,
-not a clean language-level latency story.
+That distribution is much more useful than looking only at P99. The early rows
+show a real Rust penalty before the native SQLite build is aligned. After the
+build-parity row, the body of the distribution is close enough that the result
+is no longer a clean wrapper-language latency story.
 
-The useful shape is:
+The useful shape is not "Rust was slower." The useful shape is:
 
-- Java writes faster in the initial row, but Rust does not have uniformly worse
-  reads
-- after the build-parity row, write throughput is effectively tied
-- the read-latency body remains close across runtimes, while the tail is noisy
+- Java writes and reads faster in the initial rows
+- after the build-parity row, Rust and Java write throughput are close
+- after the build-parity row, the read-latency body is close across runtimes
 - the value-sharing commit shows that the huge Rust RSS number was benchmark
   data ownership, not SQLite
 
-## The First Suspicion: Wrapper Overhead
+## First Suspicion: Wrapper Overhead
 
 The Rust read probe originally used:
 
@@ -102,7 +106,7 @@ A reasonable suspicion was that `rusqlite`'s higher-level `query_row` path was
 adding measurable overhead. I replaced it with a lower-level path using
 `raw_bind_parameter` and `raw_query`.
 
-That did not explain the gap.
+That did not explain the benchmark.
 
 The raw read path did not materially change the conclusion. More importantly,
 read-mode controls let me separate "SQLite has to copy the value blob" from
@@ -148,7 +152,7 @@ runtime `PRAGMA compile_options`.
 That was the turn. The Rust and Java binaries were not using equivalent SQLite
 C builds.
 
-## The Actual Cause: Different SQLite C Builds
+## One Real Factor: Different SQLite C Builds
 
 The Rust and Java binaries were not running the same SQLite build.
 
@@ -164,8 +168,8 @@ The important differences were:
 - xerial had `DEFAULT_MEMSTATUS=0`.
 - xerial had `DISABLE_PAGECACHE_OVERFLOW_STATS`.
 
-Those flags matter in this workload. The hot path is a tight loop of binding a
-key, binding an expiry timestamp, binding a blob, stepping the statement, and
+Those flags can matter in this workload. The hot path is a tight loop of binding
+a key, binding an expiry timestamp, binding a blob, stepping the statement, and
 resetting for the next row. Extra SQLite memory/status bookkeeping and API
 defensive checks land directly on that path.
 
@@ -196,25 +200,26 @@ And the Rust build no longer reported:
 - `ENABLE_API_ARMOR`
 - `ENABLE_MEMORY_MANAGEMENT`
 
-## The Result
+## What Changed
 
 After aligning SQLite C build flags and the Rust release build settings, the
 clean conclusion is narrower than "Rust became faster." The public reproduction
-shows that the initial Java-write-throughput advantage is not a stable language
+shows that the initial Java write-throughput advantage is not a stable language
 property: by the build-parity row, Rust and Java write throughput is effectively
 tied.
 
-The read distribution says the same thing in a different way. P50/P75/P90 are
-close across runtimes. P95/P99 are where the numbers jump around, and those
-tails are sensitive to the mixed writer/reader workload, OS scheduling, and
-local machine noise.
+The read distribution says the same thing in a different way. The initial rows
+show Rust paying for the native build configuration. After build parity,
+P50/P75/P90 are close across runtimes, and the remaining differences are small
+enough to be sensitive to the mixed writer/reader workload and local machine
+noise.
 
-The final row is the more useful steady-state comparison for this repository:
+The final row is the more useful comparison for this repository:
 after value buffers are shared correctly, Rust and Java write throughput and
 the main read-latency body are close, while Rust no longer pays the accidental
 multi-gigabyte synthetic-row ownership cost.
 
-That is the honest conclusion: once both runtimes use a more comparable SQLite C
+That is the honest conclusion: once both runtimes use a more comparable native
 build and the benchmark owns data the same way, the result is mostly a SQLite
 and workload result, not a wrapper-language result.
 
@@ -243,7 +248,7 @@ The RSS change in the public reproduction was dramatic:
 
 | Runtime | Before max RSS | After max RSS |
 |---|---:|---:|
-| Rust SQLite | 3,092 MiB | 98 MiB |
+| Rust SQLite | 3,095 MiB | 107 MiB |
 
 That is a useful reminder: a benchmark can accidentally measure its data
 generator as much as the database.
@@ -260,9 +265,12 @@ For SQLite, the critical comparison was:
 - Is the benchmark generating and owning data the same way?
 - Are read query shapes actually identical?
 
-In this case, the initial write-throughput discrepancy was mostly native build
-configuration. The initial Rust RSS problem was mostly value-buffer ownership
-during synthetic row expansion.
+In this case, the initial write-throughput discrepancy was affected by native
+build configuration. The initial Rust RSS problem was value-buffer ownership
+during synthetic row expansion. The read-latency story became much narrower
+after the native build settings were aligned: the body of the distribution was
+then close enough that wrapper-language differences were not the dominant
+factor.
 
 Once those were fixed, Rust and Java were close enough that wrapper-language
 differences were not the dominant factor.
@@ -272,8 +280,8 @@ differences were not the dominant factor.
 SQLite WAL with `synchronous=NORMAL` looked plausible enough for this style of
 local cache experiment to justify deeper testing:
 
-- writes were around 12k rows/sec in the measured mixed workload
-- 10 concurrent point-read probes stayed around 100-200us through P75 and a few
+- writes were around 17k rows/sec in the measured mixed workload
+- 10 concurrent point-read probes stayed around 200-260us through P75 and a few
   hundred microseconds through P95 in the final public-reproduction run
 - memory use was modest once value buffers were shared correctly
 
