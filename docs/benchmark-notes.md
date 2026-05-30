@@ -22,3 +22,10 @@ The benchmark now has read modes:
 The important observation is whether the gap exists even when SQLite does
 not need to materialize the blob. If it does, blob copying is not the main
 read-latency cause.
+
+
+    ## Raw Rust Read Probe
+
+    Replacing `query_row` with raw bind/query is a useful control. If this does
+    not close the gap, the wrapper path is not the primary issue.
+    
