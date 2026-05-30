@@ -7,3 +7,10 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
+
+
+    [profile.release]
+    lto = "fat"
+    codegen-units = 1
+    panic = "abort"
+    
