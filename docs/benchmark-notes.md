@@ -10,3 +10,15 @@ Java uses xerial SQLite JDBC.
 
 Initial result to investigate: Rust appears slower than Java under the same
 workload shape.
+
+## Added Measurements
+
+The benchmark now has read modes:
+
+- `exists`: `SELECT 1`
+- `metadata`: `SELECT expires_at_ms`
+- `value`: `SELECT value`
+
+The important observation is whether the gap exists even when SQLite does
+not need to materialize the blob. If it does, blob copying is not the main
+read-latency cause.
