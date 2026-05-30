@@ -58,7 +58,7 @@ enum ReadMode {
 struct Row {
     key: String,
     expires_at_ms: i64,
-    value: Vec<u8>,
+    value: Arc<[u8]>,
 }
 
 #[derive(Clone, Copy)]
@@ -187,8 +187,11 @@ fn generate_rows(count: usize, value_bytes: usize) -> Vec<Row> {
     rows
 }
 
-fn deterministic_bytes(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+fn deterministic_bytes(len: usize) -> Arc<[u8]> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect::<Vec<_>>()
+        .into()
 }
 
 fn prepare_db(path: &Path) -> Result<()> {
@@ -226,7 +229,7 @@ fn write_for(path: &Path, rows: &[Row], batch_size: usize, duration: Duration) -
                     if started.elapsed() >= duration {
                         break;
                     }
-                    stmt.execute((&row.key, row.expires_at_ms, row.value.as_slice()))?;
+                    stmt.execute((&row.key, row.expires_at_ms, row.value.as_ref()))?;
                     pending += 1;
                 }
             }

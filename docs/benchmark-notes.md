@@ -57,3 +57,10 @@ read-latency cause.
     After this change, Rust and Java should converge if the root cause was the
     SQLite C build rather than the wrapper language.
     
+
+    ## Value Buffer Ownership
+
+    Synthetic expansion should mutate keys while reusing value bytes. In Rust,
+    storing values as `Vec<u8>` and cloning rows deep-copies the value. Storing
+    values as `Arc<[u8]>` makes expansion match Java's shared `byte[]` behavior.
+    
