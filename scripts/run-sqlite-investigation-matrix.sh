@@ -22,6 +22,8 @@ set -euo pipefail
 #   SQLITE_BENCH_CARGO_TARGET_ROOT
 #                           root for per-commit Cargo target dirs
 #   SQLITE_BENCH_CARGO_HOME optional Cargo home override
+#   SQLITE_BENCH_GRADLE_USER_HOME
+#                           optional Gradle user home override
 #   SQLITE_BENCH_CARGO_CLEAN=1
 #                           run cargo clean before each release build
 #   SQLITE_BENCH_TIME_BIN   time binary, default /usr/bin/time
@@ -33,10 +35,9 @@ set -euo pipefail
 # Fast prerequisite check:
 #   scripts/run-sqlite-investigation-matrix.sh --preflight
 #
-# To move all heavy run artifacts off the default cache path, set
+# To move all runner-managed heavy artifacts off the default cache path, set
 # SQLITE_BENCH_CACHE_DIR. SQLITE_BENCH_CARGO_TARGET_ROOT only moves Cargo
-# target directories; worktrees, logs, DBs, and results stay under
-# SQLITE_BENCH_RUN_DIR or SQLITE_BENCH_CACHE_DIR/runs.
+# target directories.
 
 commits=(
   "f6c2aae:initial"
@@ -70,7 +71,8 @@ main() {
   out="$base/results.tsv"
   compile_options_dir="$base/compile-options"
   cargo_target_root="${SQLITE_BENCH_CARGO_TARGET_ROOT:-$cache_root/cargo-targets}"
-  cargo_home="${SQLITE_BENCH_CARGO_HOME:-${CARGO_HOME:-}}"
+  cargo_home="${SQLITE_BENCH_CARGO_HOME:-${CARGO_HOME:-$cache_root/cargo-home}}"
+  gradle_user_home="${SQLITE_BENCH_GRADLE_USER_HOME:-${GRADLE_USER_HOME:-$cache_root/gradle-home}}"
   cargo_clean="${SQLITE_BENCH_CARGO_CLEAN:-0}"
   time_bin="${SQLITE_BENCH_TIME_BIN:-/usr/bin/time}"
   time_style="${SQLITE_BENCH_TIME_STYLE:-$(detect_time_style)}"
@@ -78,7 +80,9 @@ main() {
   rustc_bin="${RUSTC:-rustc}"
   gradle_bin="${GRADLE_BIN:-gradle}"
 
-  mkdir -p "$base" "$compile_options_dir" "$cargo_target_root"
+  print_directory_report
+
+  mkdir -p "$base" "$compile_options_dir" "$cargo_target_root" "$cargo_home" "$gradle_user_home"
   preflight
   if (( preflight_only )) || [[ "${RUNNER_PREFLIGHT_ONLY:-}" == "1" ]]; then
     printf "runner preflight ok\n"
@@ -197,6 +201,23 @@ results_header() {
   printf "%b\n" "commit\tlabel\tlanguage\twrites_per_s\tread_p50_us\tread_p75_us\tread_p90_us\tread_p95_us\tread_p99_us\tmax_rss_bytes\telapsed_seconds\tuser_seconds\tsystem_seconds\tcpu_percent\tminor_page_faults\tmajor_page_faults\tvoluntary_context_switches\tinvoluntary_context_switches\tfile_system_inputs\tfile_system_outputs\tcompile_options_file"
 }
 
+print_directory_report() {
+  cat >&2 <<EOF
+runner paths:
+  repo: $repo
+  cache_root: $cache_root
+  run_dir: $base
+  worktrees: $base/<commit>
+  logs_dbs_results: $base
+  results_file: $out
+  compile_options_dir: $compile_options_dir
+  cargo_target_root: $cargo_target_root
+  cargo_target_dirs: $cargo_target_root/<commit>
+  cargo_home: $cargo_home
+  gradle_user_home: $gradle_user_home
+EOF
+}
+
 dump_compile_options() {
   local commit="$1"
   local lang="$2"
@@ -219,10 +240,7 @@ build_commit() {
   local java_build_log="$base/${commit}-java-build.log"
   local cargo_target_dir
   cargo_target_dir="$(rust_target_dir "$commit")"
-  local cargo_env=("CARGO_TARGET_DIR=$cargo_target_dir")
-  if [[ -n "$cargo_home" ]]; then
-    cargo_env+=("CARGO_HOME=$cargo_home")
-  fi
+  local cargo_env=("CARGO_TARGET_DIR=$cargo_target_dir" "CARGO_HOME=$cargo_home")
 
   run_logged "$rust_build_log" env "${cargo_env[@]}" bash -c '
     set -euo pipefail
@@ -233,7 +251,7 @@ build_commit() {
     "$2" build --release
   ' bash "$wt/rust" "$cargo_bin" "$cargo_clean"
 
-  run_logged "$java_build_log" bash -c '
+  run_logged "$java_build_log" env "GRADLE_USER_HOME=$gradle_user_home" bash -c '
     set -euo pipefail
     cd "$1"
     "$2" clean installDist
@@ -294,9 +312,9 @@ EOF
     return 1
   fi
 
-  "$cargo_bin" --version >/dev/null
+  CARGO_HOME="$cargo_home" "$cargo_bin" --version >/dev/null
   "$rustc_bin" --version >/dev/null
-  "$gradle_bin" --version >/dev/null
+  GRADLE_USER_HOME="$gradle_user_home" "$gradle_bin" --version >/dev/null
   check_java25_toolchain
 }
 
@@ -313,7 +331,7 @@ require_command() {
 check_java25_toolchain() {
   local toolchains_log="$base/java-toolchains.log"
 
-  if ! "$gradle_bin" -p "$repo/java" -q javaToolchains > "$toolchains_log" 2>&1; then
+  if ! GRADLE_USER_HOME="$gradle_user_home" "$gradle_bin" -p "$repo/java" -q javaToolchains > "$toolchains_log" 2>&1; then
     cat >&2 <<EOF
 gradle is installed, but Gradle could not list Java toolchains.
 See: $toolchains_log
@@ -545,6 +563,22 @@ self_test() {
   row="$(emit_row c l rust 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 file)"
   [[ "$(awk -F'\t' '{ print NF }' "$out")" == "21" ]]
   [[ "$row" == "$(awk '{ print }' "$out")" ]]
+
+  repo="$tmp/repo"
+  cache_root="$tmp/cache"
+  base="$tmp/cache/runs"
+  out="$tmp/cache/runs/results.tsv"
+  compile_options_dir="$tmp/cache/runs/compile-options"
+  cargo_target_root="$tmp/cache/cargo-targets"
+  cargo_home="$tmp/cache/cargo-home"
+  gradle_user_home="$tmp/cache/gradle-home"
+  print_directory_report > "$tmp/dir-report.stdout" 2> "$tmp/dir-report.stderr"
+  [[ ! -s "$tmp/dir-report.stdout" ]]
+  grep -q "runner paths:" "$tmp/dir-report.stderr"
+  grep -q "run_dir: $base" "$tmp/dir-report.stderr"
+  grep -q "cargo_target_root: $cargo_target_root" "$tmp/dir-report.stderr"
+  grep -q "cargo_home: $cargo_home" "$tmp/dir-report.stderr"
+  grep -q "gradle_user_home: $gradle_user_home" "$tmp/dir-report.stderr"
 
   printf "123456  maximum resident set size\n" > "$tmp/bsd-time.log"
   [[ "$(parse_rss_bytes "$tmp/bsd-time.log")" == "123456" ]]
