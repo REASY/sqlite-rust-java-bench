@@ -9,7 +9,8 @@ set -euo pipefail
 #   --warmup-secs 5
 #
 # The app-level writes/s timer excludes process startup, row generation, and
-# warm-up. RSS is still process-level max RSS from the platform time tool.
+# warm-up. Resource metrics are process-level values from the platform time
+# tool, so they include process startup, row generation, and warm-up.
 #
 # Outputs:
 #   ${SQLITE_BENCH_RUN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sqlite-rust-java-bench/runs}/results.tsv
@@ -18,8 +19,8 @@ set -euo pipefail
 #   SQLITE_BENCH_REPO       repository root to use
 #   SQLITE_BENCH_RUN_DIR    directory for worktrees, logs, DBs, and results
 #   SQLITE_BENCH_CACHE_DIR  cache root for default run and Cargo target dirs
-#   SQLITE_BENCH_CARGO_TARGET_DIR
-#                           shared Cargo target dir, default under cache root
+#   SQLITE_BENCH_CARGO_TARGET_ROOT
+#                           root for per-commit Cargo target dirs
 #   SQLITE_BENCH_CARGO_HOME optional Cargo home override
 #   SQLITE_BENCH_CARGO_CLEAN=1
 #                           run cargo clean before each release build
@@ -63,7 +64,7 @@ main() {
   base="${base%/}"
   out="$base/results.tsv"
   compile_options_dir="$base/compile-options"
-  cargo_target_dir="${SQLITE_BENCH_CARGO_TARGET_DIR:-$cache_root/cargo-target}"
+  cargo_target_root="${SQLITE_BENCH_CARGO_TARGET_ROOT:-$cache_root/cargo-targets}"
   cargo_home="${SQLITE_BENCH_CARGO_HOME:-${CARGO_HOME:-}}"
   cargo_clean="${SQLITE_BENCH_CARGO_CLEAN:-0}"
   time_bin="${SQLITE_BENCH_TIME_BIN:-/usr/bin/time}"
@@ -72,17 +73,15 @@ main() {
   rustc_bin="${RUSTC:-rustc}"
   gradle_bin="${GRADLE_BIN:-gradle}"
 
-  mkdir -p "$base" "$compile_options_dir" "$cargo_target_dir"
+  mkdir -p "$base" "$compile_options_dir" "$cargo_target_root"
   preflight
   if (( preflight_only )) || [[ "${RUNNER_PREFLIGHT_ONLY:-}" == "1" ]]; then
     printf "runner preflight ok\n"
     return
   fi
 
-  local header
-  header="commit\tlabel\tlanguage\twrites_per_s\tread_p50_us\tread_p75_us\tread_p90_us\tread_p95_us\tread_p99_us\tmax_rss_bytes\tcompile_options_file"
-  printf "%b\n" "$header" > "$out"
-  printf "%b\n" "$header"
+  results_header > "$out"
+  results_header
 
   local item
   for item in "${commits[@]}"; do
@@ -110,7 +109,7 @@ run_one() {
   local compile_options_file="$compile_options_dir/${commit}-${lang}.txt"
 
   if [[ "$lang" == "rust" ]]; then
-    run_timed "$log" "$(rust_binary_path)" \
+    run_timed "$log" "$(rust_binary_path "$commit")" \
       --db-path "$db" \
       --rows 500000 \
       --value-bytes 5700 \
@@ -140,6 +139,16 @@ run_one() {
   local p95
   local p99
   local rss
+  local elapsed_seconds=""
+  local user_seconds=""
+  local system_seconds=""
+  local cpu_percent=""
+  local minor_page_faults=""
+  local major_page_faults=""
+  local voluntary_context_switches=""
+  local involuntary_context_switches=""
+  local file_system_inputs=""
+  local file_system_outputs=""
   writes="$(awk -F'[()]' '/wrote/ { split($2, a, " "); print a[1]; exit }' "$log")"
   p50="$(awk -F'p50_us=' '/read probe:/ { split($2, a, /[^0-9]/); print a[1]; exit }' "$log")"
   p75="$(awk -F'p75_us=' '/read probe:/ { split($2, a, /[^0-9]/); print a[1]; exit }' "$log")"
@@ -147,13 +156,42 @@ run_one() {
   p95="$(awk -F'p95_us=' '/read probe:/ { split($2, a, /[^0-9]/); print a[1]; exit }' "$log")"
   p99="$(awk -F'p99_us=' '/read probe:/ { split($2, a, /[^0-9]/); print a[1]; exit }' "$log")"
   rss="$(parse_rss_bytes "$log")"
-  emit_row "$commit" "$label" "$lang" "$writes" "$p50" "$p75" "$p90" "$p95" "$p99" "$rss" "$compile_options_file"
+
+  local metric
+  local metric_index=0
+  while IFS= read -r metric; do
+    case "$metric_index" in
+      0) elapsed_seconds="$metric" ;;
+      1) user_seconds="$metric" ;;
+      2) system_seconds="$metric" ;;
+      3) cpu_percent="$metric" ;;
+      4) minor_page_faults="$metric" ;;
+      5) major_page_faults="$metric" ;;
+      6) voluntary_context_switches="$metric" ;;
+      7) involuntary_context_switches="$metric" ;;
+      8) file_system_inputs="$metric" ;;
+      9) file_system_outputs="$metric" ;;
+    esac
+    metric_index=$((metric_index + 1))
+  done < <(parse_time_metrics "$log")
+
+  emit_row "$commit" "$label" "$lang" "$writes" "$p50" "$p75" "$p90" "$p95" "$p99" "$rss" "$elapsed_seconds" "$user_seconds" "$system_seconds" "$cpu_percent" "$minor_page_faults" "$major_page_faults" "$voluntary_context_switches" "$involuntary_context_switches" "$file_system_inputs" "$file_system_outputs" "$compile_options_file"
 }
 
 emit_row() {
-  local row
-  printf -v row "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" "$@"
+  local row=""
+  local value
+  for value in "$@"; do
+    if [[ -n "$row" ]]; then
+      row+=$'\t'
+    fi
+    row+="$value"
+  done
   printf "%s\n" "$row" | tee -a "$out"
+}
+
+results_header() {
+  printf "%b\n" "commit\tlabel\tlanguage\twrites_per_s\tread_p50_us\tread_p75_us\tread_p90_us\tread_p95_us\tread_p99_us\tmax_rss_bytes\telapsed_seconds\tuser_seconds\tsystem_seconds\tcpu_percent\tminor_page_faults\tmajor_page_faults\tvoluntary_context_switches\tinvoluntary_context_switches\tfile_system_inputs\tfile_system_outputs\tcompile_options_file"
 }
 
 dump_compile_options() {
@@ -163,7 +201,7 @@ dump_compile_options() {
   local compile_options_file="$compile_options_dir/${commit}-${lang}.txt"
 
   if [[ "$lang" == "rust" ]]; then
-    "$(rust_binary_path)" \
+    "$(rust_binary_path "$commit")" \
       --dump-sqlite-compile-options > "$compile_options_file"
   else
     "$wt/java/build/install/sqlite-build-flags-bench-java/bin/sqlite-build-flags-bench-java" \
@@ -176,6 +214,8 @@ build_commit() {
   local wt="$base/$commit"
   local rust_build_log="$base/${commit}-rust-build.log"
   local java_build_log="$base/${commit}-java-build.log"
+  local cargo_target_dir
+  cargo_target_dir="$(rust_target_dir "$commit")"
   local cargo_env=("CARGO_TARGET_DIR=$cargo_target_dir")
   if [[ -n "$cargo_home" ]]; then
     cargo_env+=("CARGO_HOME=$cargo_home")
@@ -198,7 +238,13 @@ build_commit() {
 }
 
 rust_binary_path() {
-  printf "%s/release/sqlite-build-flags-bench" "$cargo_target_dir"
+  local commit="$1"
+  printf "%s/release/sqlite-build-flags-bench" "$(rust_target_dir "$commit")"
+}
+
+rust_target_dir() {
+  local commit="$1"
+  printf "%s/%s" "$cargo_target_root" "$commit"
 }
 
 run_logged() {
@@ -319,10 +365,10 @@ detect_time_style() {
   fi
   if "$time_bin" -l true >/dev/null 2>&1; then
     printf "bsd\n"
-  elif "$time_bin" -v true >/dev/null 2>&1; then
+  elif "$time_bin" -pv true >/dev/null 2>&1; then
     printf "gnu\n"
   else
-    echo "$time_bin supports neither BSD -l nor GNU -v output" >&2
+    echo "$time_bin supports neither BSD -l nor GNU -pv output" >&2
     return 1
   fi
 }
@@ -335,7 +381,7 @@ run_timed() {
       "$time_bin" -l "$@" > "$log" 2>&1
       ;;
     gnu)
-      "$time_bin" -v "$@" > "$log" 2>&1
+      "$time_bin" -pv "$@" > "$log" 2>&1
       ;;
     *)
       echo "unsupported time style: $time_style" >&2
@@ -361,15 +407,164 @@ parse_rss_bytes() {
   ' "$log"
 }
 
+parse_time_metrics() {
+  local log="$1"
+  awk '
+    function duration_seconds(value, parts, n) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      n = split(value, parts, ":")
+      if (n == 3) {
+        return parts[1] * 3600 + parts[2] * 60 + parts[3]
+      }
+      if (n == 2) {
+        return parts[1] * 60 + parts[2]
+      }
+      return value + 0
+    }
+    /^[[:space:]]*[0-9.]+[[:space:]]+real[[:space:]]+[0-9.]+[[:space:]]+user[[:space:]]+[0-9.]+[[:space:]]+sys/ {
+      elapsed = $1
+      user = $3
+      sys_seconds = $5
+    }
+    /^real[[:space:]]+/ {
+      elapsed = $2
+    }
+    /^user[[:space:]]+/ {
+      user = $2
+    }
+    /^sys[[:space:]]+/ {
+      sys_seconds = $2
+    }
+    /User time \(seconds\):/ {
+      user = $NF
+    }
+    /System time \(seconds\):/ {
+      sys_seconds = $NF
+    }
+    /Percent of CPU this job got:/ {
+      cpu = $NF
+      gsub(/%/, "", cpu)
+    }
+    /Elapsed \(wall clock\) time.*:/ {
+      elapsed = duration_seconds($NF)
+    }
+    /Minor \(reclaiming a frame\) page faults:/ {
+      minor = $NF
+    }
+    /Major \(requiring I\/O\) page faults:/ {
+      major = $NF
+    }
+    /Voluntary context switches:/ {
+      voluntary = $NF
+    }
+    /Involuntary context switches:/ {
+      involuntary = $NF
+    }
+    /File system inputs:/ {
+      fs_inputs = $NF
+    }
+    /File system outputs:/ {
+      fs_outputs = $NF
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]+page reclaims/ {
+      minor = $1
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]+page faults/ {
+      major = $1
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]+voluntary context switches/ {
+      voluntary = $1
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]+involuntary context switches/ {
+      involuntary = $1
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]+file system inputs/ {
+      fs_inputs = $1
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]+file system outputs/ {
+      fs_outputs = $1
+    }
+    END {
+      if (cpu == "" && elapsed != "" && elapsed > 0 && user != "" && sys_seconds != "") {
+        cpu = sprintf("%.2f", ((user + sys_seconds) / elapsed) * 100)
+      }
+      print elapsed
+      print user
+      print sys_seconds
+      print cpu
+      print minor
+      print major
+      print voluntary
+      print involuntary
+      print fs_inputs
+      print fs_outputs
+    }
+  ' "$log"
+}
+
+join_lines() {
+  awk '
+    {
+      if (NR > 1) {
+        printf " "
+      }
+      printf "%s", $0
+    }
+    END {
+      printf "\n"
+    }
+  '
+}
+
 self_test() {
   local tmp
+  local metrics
+  local row
   tmp="$(mktemp -d)"
+
+  [[ "$(results_header | awk -F'\t' '{ print NF }')" == "21" ]]
+  [[ "$(results_header)" == *$'\telapsed_seconds\tuser_seconds\tsystem_seconds\tcpu_percent\tminor_page_faults\tmajor_page_faults\tvoluntary_context_switches\tinvoluntary_context_switches\tfile_system_inputs\tfile_system_outputs\t'* ]]
+
+  out="$tmp/results.tsv"
+  row="$(emit_row c l rust 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 file)"
+  [[ "$(awk -F'\t' '{ print NF }' "$out")" == "21" ]]
+  [[ "$row" == "$(awk '{ print }' "$out")" ]]
 
   printf "123456  maximum resident set size\n" > "$tmp/bsd-time.log"
   [[ "$(parse_rss_bytes "$tmp/bsd-time.log")" == "123456" ]]
 
   printf "Maximum resident set size (kbytes): 789\n" > "$tmp/gnu-time.log"
   [[ "$(parse_rss_bytes "$tmp/gnu-time.log")" == "807936" ]]
+
+  cat > "$tmp/gnu-time-metrics.log" <<'EOF'
+real 35.25
+user 31.50
+sys 2.75
+	User time (seconds): 31.50
+	System time (seconds): 2.75
+	Percent of CPU this job got: 97%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:35.25
+	Minor (reclaiming a frame) page faults: 1234
+	Major (requiring I/O) page faults: 5
+	Voluntary context switches: 67
+	Involuntary context switches: 89
+	File system inputs: 101
+	File system outputs: 202
+EOF
+  metrics="$(parse_time_metrics "$tmp/gnu-time-metrics.log" | join_lines)"
+  [[ "$metrics" == "35.25 31.50 2.75 97 1234 5 67 89 101 202" ]]
+
+  cat > "$tmp/bsd-time-metrics.log" <<'EOF'
+       40.00 real        30.00 user         5.00 sys
+              1234  page reclaims
+                 5  page faults
+                67  voluntary context switches
+                89  involuntary context switches
+               101  file system inputs
+               202  file system outputs
+EOF
+  metrics="$(parse_time_metrics "$tmp/bsd-time-metrics.log" | join_lines)"
+  [[ "$metrics" == "40.00 30.00 5.00 87.50 1234 5 67 89 101 202" ]]
 
   cat > "$tmp/java-toolchains-ok.log" <<'EOF'
 + Azul Zulu JDK 25.0.1
@@ -412,7 +607,7 @@ EOF
 
   repo="$tmp/repo"
   base="$tmp/base"
-  cargo_target_dir="$tmp/shared-cargo-target"
+  cargo_target_root="$tmp/cargo-targets"
   cargo_home="$tmp/cargo-home"
   cargo_clean=0
   cargo_bin="$fake_bin/cargo"
@@ -422,7 +617,7 @@ EOF
 
   mkdir -p "$base/fake/rust" "$base/fake/java"
   FAKE_CARGO_ENV_LOG="$tmp/cargo-env.log" build_commit "fake"
-  grep -q "^build:$cargo_target_dir:$cargo_home$" "$tmp/cargo-env.log"
+  grep -q "^build:$cargo_target_root/fake:$cargo_home$" "$tmp/cargo-env.log"
   ! grep -q "^clean:" "$tmp/cargo-env.log"
 
   cat > "$fake_bin/git" <<'EOF'

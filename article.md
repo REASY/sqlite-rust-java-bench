@@ -56,8 +56,9 @@ scripts/run-sqlite-investigation-matrix.sh
 
 Each process does a 5-second in-process warm-up before the measured 30-second
 window. Write throughput and read latency come from the benchmark's measured
-window. RSS is max process RSS from `/usr/bin/time -l`, so it includes row
-generation and warm-up allocation.
+window. Process metrics come from `/usr/bin/time -l` on macOS and
+`/usr/bin/time -pv` on Linux, so they include row generation and warm-up
+allocation.
 
 One run on my machine looked like this:
 
