@@ -12,11 +12,17 @@ set -euo pipefail
 # warm-up. RSS is still process-level max RSS from the platform time tool.
 #
 # Outputs:
-#   ${SQLITE_BENCH_RUN_DIR:-${TMPDIR:-/tmp}/sqlite-build-flags-bench-runs}/results.tsv
+#   ${SQLITE_BENCH_RUN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sqlite-rust-java-bench/runs}/results.tsv
 #
 # Optional overrides:
 #   SQLITE_BENCH_REPO       repository root to use
 #   SQLITE_BENCH_RUN_DIR    directory for worktrees, logs, DBs, and results
+#   SQLITE_BENCH_CACHE_DIR  cache root for default run and Cargo target dirs
+#   SQLITE_BENCH_CARGO_TARGET_DIR
+#                           shared Cargo target dir, default under cache root
+#   SQLITE_BENCH_CARGO_HOME optional Cargo home override
+#   SQLITE_BENCH_CARGO_CLEAN=1
+#                           run cargo clean before each release build
 #   SQLITE_BENCH_TIME_BIN   time binary, default /usr/bin/time
 #   SQLITE_BENCH_TIME_STYLE bsd or gnu, otherwise auto-detected
 #   CARGO                   cargo binary, default cargo
@@ -52,17 +58,21 @@ main() {
   local script_dir
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   repo="${SQLITE_BENCH_REPO:-$(git -C "$script_dir/.." rev-parse --show-toplevel)}"
-  base="${SQLITE_BENCH_RUN_DIR:-${TMPDIR:-/tmp}/sqlite-build-flags-bench-runs}"
+  cache_root="${SQLITE_BENCH_CACHE_DIR:-$(default_cache_root)/sqlite-rust-java-bench}"
+  base="${SQLITE_BENCH_RUN_DIR:-$cache_root/runs}"
   base="${base%/}"
   out="$base/results.tsv"
   compile_options_dir="$base/compile-options"
+  cargo_target_dir="${SQLITE_BENCH_CARGO_TARGET_DIR:-$cache_root/cargo-target}"
+  cargo_home="${SQLITE_BENCH_CARGO_HOME:-${CARGO_HOME:-}}"
+  cargo_clean="${SQLITE_BENCH_CARGO_CLEAN:-0}"
   time_bin="${SQLITE_BENCH_TIME_BIN:-/usr/bin/time}"
   time_style="${SQLITE_BENCH_TIME_STYLE:-$(detect_time_style)}"
   cargo_bin="${CARGO:-cargo}"
   rustc_bin="${RUSTC:-rustc}"
   gradle_bin="${GRADLE_BIN:-gradle}"
 
-  mkdir -p "$base" "$compile_options_dir"
+  mkdir -p "$base" "$compile_options_dir" "$cargo_target_dir"
   preflight
   if (( preflight_only )) || [[ "${RUNNER_PREFLIGHT_ONLY:-}" == "1" ]]; then
     printf "runner preflight ok\n"
@@ -100,7 +110,7 @@ run_one() {
   local compile_options_file="$compile_options_dir/${commit}-${lang}.txt"
 
   if [[ "$lang" == "rust" ]]; then
-    run_timed "$log" "$wt/rust/target/release/sqlite-build-flags-bench" \
+    run_timed "$log" "$(rust_binary_path)" \
       --db-path "$db" \
       --rows 500000 \
       --value-bytes 5700 \
@@ -153,7 +163,7 @@ dump_compile_options() {
   local compile_options_file="$compile_options_dir/${commit}-${lang}.txt"
 
   if [[ "$lang" == "rust" ]]; then
-    "$wt/rust/target/release/sqlite-build-flags-bench" \
+    "$(rust_binary_path)" \
       --dump-sqlite-compile-options > "$compile_options_file"
   else
     "$wt/java/build/install/sqlite-build-flags-bench-java/bin/sqlite-build-flags-bench-java" \
@@ -166,19 +176,29 @@ build_commit() {
   local wt="$base/$commit"
   local rust_build_log="$base/${commit}-rust-build.log"
   local java_build_log="$base/${commit}-java-build.log"
+  local cargo_env=("CARGO_TARGET_DIR=$cargo_target_dir")
+  if [[ -n "$cargo_home" ]]; then
+    cargo_env+=("CARGO_HOME=$cargo_home")
+  fi
 
-  run_logged "$rust_build_log" bash -c '
+  run_logged "$rust_build_log" env "${cargo_env[@]}" bash -c '
     set -euo pipefail
     cd "$1"
-    "$2" clean
+    if [[ "$3" == "1" ]]; then
+      "$2" clean
+    fi
     "$2" build --release
-  ' bash "$wt/rust" "$cargo_bin"
+  ' bash "$wt/rust" "$cargo_bin" "$cargo_clean"
 
   run_logged "$java_build_log" bash -c '
     set -euo pipefail
     cd "$1"
     "$2" clean installDist
   ' bash "$wt/java" "$gradle_bin"
+}
+
+rust_binary_path() {
+  printf "%s/release/sqlite-build-flags-bench" "$cargo_target_dir"
 }
 
 run_logged() {
@@ -282,6 +302,16 @@ has_java25_azul_toolchain() {
   ' "$toolchains_log"
 }
 
+default_cache_root() {
+  if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+    printf "%s\n" "$XDG_CACHE_HOME"
+  elif [[ -n "${HOME:-}" ]]; then
+    printf "%s/.cache\n" "$HOME"
+  else
+    printf "%s\n" "${TMPDIR:-/tmp}"
+  fi
+}
+
 detect_time_style() {
   if [[ ! -x "$time_bin" ]]; then
     echo "time binary is not executable: $time_bin" >&2
@@ -360,7 +390,11 @@ EOF
   mkdir -p "$fake_bin" "$tmp/repo/java" "$tmp/base"
   cat > "$fake_bin/cargo" <<'EOF'
 #!/usr/bin/env bash
-echo "cargo 1.0.0"
+if [[ "${1:-}" == "--version" ]]; then
+  echo "cargo 1.0.0"
+  exit 0
+fi
+echo "$1:${CARGO_TARGET_DIR:-}:${CARGO_HOME:-}" >> "$FAKE_CARGO_ENV_LOG"
 EOF
   cat > "$fake_bin/rustc" <<'EOF'
 #!/usr/bin/env bash
@@ -378,10 +412,18 @@ EOF
 
   repo="$tmp/repo"
   base="$tmp/base"
+  cargo_target_dir="$tmp/shared-cargo-target"
+  cargo_home="$tmp/cargo-home"
+  cargo_clean=0
   cargo_bin="$fake_bin/cargo"
   rustc_bin="$fake_bin/rustc"
   gradle_bin="$fake_bin/gradle"
   FAKE_JAVA_TOOLCHAINS="$tmp/java-toolchains-ok.log" preflight
+
+  mkdir -p "$base/fake/rust" "$base/fake/java"
+  FAKE_CARGO_ENV_LOG="$tmp/cargo-env.log" build_commit "fake"
+  grep -q "^build:$cargo_target_dir:$cargo_home$" "$tmp/cargo-env.log"
+  ! grep -q "^clean:" "$tmp/cargo-env.log"
 
   cat > "$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
