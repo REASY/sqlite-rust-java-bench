@@ -32,6 +32,11 @@ set -euo pipefail
 #
 # Fast prerequisite check:
 #   scripts/run-sqlite-investigation-matrix.sh --preflight
+#
+# To move all heavy run artifacts off the default cache path, set
+# SQLITE_BENCH_CACHE_DIR. SQLITE_BENCH_CARGO_TARGET_ROOT only moves Cargo
+# target directories; worktrees, logs, DBs, and results stay under
+# SQLITE_BENCH_RUN_DIR or SQLITE_BENCH_CACHE_DIR/runs.
 
 commits=(
   "f6c2aae:initial"
@@ -88,9 +93,7 @@ main() {
     commit="${item%%:*}"
     label="${item#*:}"
     wt="$base/$commit"
-    if [[ ! -e "$wt/.git" ]]; then
-      run_logged "$base/${commit}-worktree.log" git -C "$repo" worktree add --detach "$wt" "$commit"
-    fi
+    ensure_worktree "$commit" "$wt" "$base/${commit}-worktree.log"
     build_commit "$commit"
     dump_compile_options "$commit" "rust"
     dump_compile_options "$commit" "java"
@@ -256,6 +259,19 @@ run_logged() {
     cat "$log" >&2
     return 1
   fi
+}
+
+ensure_worktree() {
+  local commit="$1"
+  local wt="$2"
+  local log="$3"
+
+  if [[ -e "$wt/.git" ]]; then
+    return
+  fi
+
+  run_logged "$log" git -C "$repo" worktree prune
+  run_logged "$log" git -C "$repo" worktree add --detach "$wt" "$commit"
 }
 
 preflight() {
@@ -622,9 +638,16 @@ EOF
 
   cat > "$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${FAKE_GIT_LOG:-}" ]]; then
+  printf "%s\n" "$*" >> "$FAKE_GIT_LOG"
+fi
 echo "git operational output"
 EOF
   chmod +x "$fake_bin/git"
+  PATH="$fake_bin:$PATH" FAKE_GIT_LOG="$tmp/git.log" ensure_worktree "abc1234" "$base/abc1234" "$tmp/worktree.log"
+  grep -q -- "^-C $repo worktree prune$" "$tmp/git.log"
+  grep -q -- "^-C $repo worktree add --detach $base/abc1234 abc1234$" "$tmp/git.log"
+
   [[ -z "$(run_logged "$tmp/worktree.log" "$fake_bin/git" worktree add)" ]]
   [[ -s "$tmp/worktree.log" ]]
 
